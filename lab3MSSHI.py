@@ -37,7 +37,7 @@ CONFIG = {
     # YOLOv8
     "yolo": {
         "weights": "yolov8n.pt",
-        "epochs": 30,
+        "epochs": 50,
         "imgsz": 640,
         "batch": 16,
         "eval_conf": 0.001  # low conf for COCO eval to avoid empty detections
@@ -45,10 +45,10 @@ CONFIG = {
 
     # TorchVision common
     "tv": {
-        "epochs": 10,
+        "epochs": 20,
         "batch_train": 4,
         "batch_val": 2,
-        "lr": 5e-4,
+        "lr": 2.5e-4,
         "weight_decay": 1e-4
     },
 
@@ -67,6 +67,15 @@ CONFIG = {
         "label_offset": -1,      # tomato -> 0 (0-based labels for FG)
         "cat_id_offset": 1,      # map 0-based predictions to COCO category_id=1 for eval
         "eval_conf": 0.0         # ensure non-empty eval results early in training
+    },
+
+    # FCOS
+    "fcos": {
+        "weights": "DEFAULT",
+        "weights_backbone": "DEFAULT",
+        "label_offset": 0,      # FCOS expects labels 1..num_classes similar to Faster R-CNN
+        "cat_id_offset": 0,
+        "eval_conf": 0.0
     },
 
     # COCO evaluation
@@ -387,6 +396,14 @@ def build_retinanet(num_fg_classes: int):
     )
     return model
 
+def build_fcos(num_fg_classes: int):
+    model = torchvision.models.detection.fcos_resnet50_fpn(
+        weights=CONFIG["fcos"]["weights"],
+        weights_backbone=CONFIG["fcos"]["weights_backbone"],
+        num_classes=num_fg_classes
+    )
+    return model
+
 @torch.no_grad()
 def evaluate_to_coco_json(model, dl, device: str, coco_gt_json: Path, score_thresh: float, category_id_offset: int, maxDets: List[int]) -> Tuple[Dict, List[Dict]]:
     model.eval()
@@ -463,6 +480,12 @@ def train_torchvision_detector(model_type: str, work_root: Path, device: str, cl
         ds_val = YoloDetectionDataset(img_val, lbl_val, classes, transforms=tform, label_offset=CONFIG["retinanet"]["label_offset"])
         cat_offset = CONFIG["retinanet"]["cat_id_offset"]
         eval_conf = CONFIG["retinanet"]["eval_conf"]
+    elif model_type == "fcos":
+        model = build_fcos(num_fg)
+        ds_tr = YoloDetectionDataset(img_tr, lbl_tr, classes, transforms=tform, label_offset=CONFIG["fcos"]["label_offset"])
+        ds_val = YoloDetectionDataset(img_val, lbl_val, classes, transforms=tform, label_offset=CONFIG["fcos"]["label_offset"])
+        cat_offset = CONFIG["fcos"]["cat_id_offset"]
+        eval_conf = CONFIG["fcos"]["eval_conf"]
     else:
         raise ValueError("Unknown model_type")
     dl_tr = torch.utils.data.DataLoader(ds_tr, batch_size=CONFIG["tv"]["batch_train"], shuffle=True, num_workers=2, collate_fn=collate_fn)
@@ -600,11 +623,18 @@ def main():
         epochs=CONFIG["tv"]["epochs"], lr=CONFIG["tv"]["lr"], wd=CONFIG["tv"]["weight_decay"]
     )
 
+    # Train + eval FCOS
+    fcos_model, fcos_metrics, fcos_dir = train_torchvision_detector(
+        "fcos", work_root, device, classes,
+        epochs=CONFIG["tv"]["epochs"], lr=CONFIG["tv"]["lr"], wd=CONFIG["tv"]["weight_decay"]
+    )
+
     # Consolidate metrics
     rows = [
         {"model": "YOLOv8n", "mAP_50_95": yolo_metrics["mAP_50_95"], "mAP_50": yolo_metrics["mAP_50"], "AR100": yolo_metrics["AR100"], "AP_tomato": yolo_metrics["AP_per_class"].get("tomato", float('nan'))},
         {"model": "Faster R-CNN", "mAP_50_95": frcnn_metrics["mAP_50_95"], "mAP_50": frcnn_metrics["mAP_50"], "AR100": frcnn_metrics["AR100"], "AP_tomato": frcnn_metrics["AP_per_class"].get("tomato", float('nan'))},
         {"model": "RetinaNet", "mAP_50_95": retina_metrics["mAP_50_95"], "mAP_50": retina_metrics["mAP_50"], "AR100": retina_metrics["AR100"], "AP_tomato": retina_metrics["AP_per_class"].get("tomato", float('nan'))},
+        {"model": "FCOS", "mAP_50_95": fcos_metrics["mAP_50_95"], "mAP_50": fcos_metrics["mAP_50"], "AR100": fcos_metrics["AR100"], "AP_tomato": fcos_metrics["AP_per_class"].get("tomato", float('nan'))},
     ]
     df = pd.DataFrame(rows)
     metrics_csv = outputs / "metrics_comparison.csv"
@@ -618,6 +648,7 @@ def main():
     visualize_model_preds_yolo(yolo_model, val_imgs, vis_dir, "yolo", device)
     visualize_model_preds_torchvision(frcnn_model, val_imgs, vis_dir, "fasterrcnn", device, classes)
     visualize_model_preds_torchvision(retina_model, val_imgs, vis_dir, "retinanet", device, classes)
+    visualize_model_preds_torchvision(fcos_model, val_imgs, vis_dir, "fcos", device, classes)
     print("Done.")
 
 if __name__ == "__main__":
